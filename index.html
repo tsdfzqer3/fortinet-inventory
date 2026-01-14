@@ -1,0 +1,1625 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <title>Infra 庫存監控系統 - Firebase即時版</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    
+    <!-- Firebase SDK -->
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-database-compat.js"></script>
+</head>
+<body class="bg-gradient-to-br from-slate-50 to-slate-100 min-h-screen p-6">
+    <div id="app"></div>
+    <script>
+        // ============ 版本控制系統 ============
+        const APP_VERSION = '2.0.20260114.010';  // 版本號：主版本.日期.修訂號 - 訂單歷史存檔功能
+        
+        // 檢查版本並自動更新
+        function checkVersion(){
+            const storedVersion = localStorage.getItem('forti-app-version');
+            if(storedVersion && storedVersion !== APP_VERSION){
+                console.log('🔄 檢測到新版本:', APP_VERSION, '(舊版本:', storedVersion + ')');
+                console.log('🔄 正在清除快取並重新載入...');
+                
+                // 清除所有快取
+                if('caches' in window){
+                    caches.keys().then(names => {
+                        names.forEach(name => caches.delete(name));
+                    });
+                }
+                
+                // 更新版本號
+                localStorage.setItem('forti-app-version', APP_VERSION);
+                
+                // 強制重新載入（帶時間戳記）
+                window.location.href = window.location.pathname + '?v=' + APP_VERSION + '&t=' + Date.now();
+                return false;
+            }
+            
+            // 首次載入或版本相同
+            if(!storedVersion){
+                console.log('✅ 首次載入，版本:', APP_VERSION);
+                localStorage.setItem('forti-app-version', APP_VERSION);
+            }else{
+                console.log('✅ 版本檢查通過:', APP_VERSION);
+            }
+            return true;
+        }
+        
+        // 立即執行版本檢查
+        if(!checkVersion()){
+            // 版本不符，已觸發重新載入，停止執行後續程式碼
+            throw new Error('版本更新中，正在重新載入...');
+        }
+        
+        // ============ Firebase 設定區 ============
+        const firebaseConfig = {
+            apiKey: "AIzaSyBuvQ8pg6ZMESFqZrArO1s-fBv5mDd9NnA",
+            authDomain: "fortinet-inventory.firebaseapp.com",
+            databaseURL: "https://fortinet-inventory-default-rtdb.asia-southeast1.firebasedatabase.app",
+            projectId: "fortinet-inventory",
+            storageBucket: "fortinet-inventory.firebasestorage.app",
+            messagingSenderId: "255369820814",
+            appId: "1:255369820814:web:a627a81333bfdf3a0227df",
+            measurementId: "G-DBXDQZY598"
+        };
+
+        // 初始化 Firebase
+        let database;
+        let firebaseInitialized = false;
+        
+        try {
+            if (!firebase.apps.length) {
+                firebase.initializeApp(firebaseConfig);
+            }
+            database = firebase.database();
+            firebaseInitialized = true;
+            console.log('✅ Firebase 初始化成功');
+            
+            // 測試連線
+            database.ref('.info/connected').on('value', (snapshot) => {
+                if (snapshot.val() === true) {
+                    state.firebaseConnected = true;
+                    console.log('✅ Firebase 已連線');
+                } else {
+                    state.firebaseConnected = false;
+                    console.log('⚠️ Firebase 未連線');
+                }
+                render();
+            });
+            
+        } catch (error) {
+            console.error('❌ Firebase 初始化失敗:', error);
+            firebaseInitialized = false;
+            state.firebaseConnected = false;
+        }
+
+        // ============ 多類別設定 ============
+        const CATEGORIES = {
+            network: {
+                id: 'network',
+                name: '網通產品',
+                icon: '🌐',
+                csvUrl: 'https://corsproxy.io/?' + encodeURIComponent('https://docs.google.com/spreadsheets/d/e/2PACX-1vTPXvFKAP0xi4WAW5EUaX-ZZt64Y8MJVZlPqpctzbNoQYsQmmHzt36MaMMby3d3qhDRZ4LN-wQAUc6p/pub?output=csv'),
+                firebasePath: 'network'
+            },
+            server: {
+                id: 'server',
+                name: 'Server 類別硬體',
+                icon: '🖥️',
+                csvUrl: '',  // 待設定
+                firebasePath: 'server'
+            },
+            client: {
+                id: 'client',
+                name: 'Client 類別硬體',
+                icon: '💻',
+                csvUrl: '',  // 待設定
+                firebasePath: 'client'
+            }
+        };
+        
+        let state={
+            currentCategory: 'network',  // 當前類別
+            productCatalog:[],
+            supplierStock:[],
+            orderHistory:[],
+            searchTerm:'',
+            lowStockThreshold:10,
+            filterZeroStock:false,
+            lastSyncDate:null,
+            supplierUpdateDate:null,
+            orderUpdateDate:null,
+            autoLoading:false,
+            firebaseConnected:firebaseInitialized,
+            showOrderManager:false,
+            orderSearchTerm:'',
+            orderHistoryArchive:[]  // 歷史訂單存檔（不會被清除）
+        };
+        const storage={get:k=>JSON.parse(localStorage.getItem(k)||'null'),set:(k,v)=>localStorage.setItem(k,JSON.stringify(v))};
+        
+        // ============ Firebase 即時同步功能 ============
+        function setupFirebaseListeners(){
+            if(!firebaseInitialized)return;
+            
+            const category = state.currentCategory;
+            const basePath = CATEGORIES[category].firebasePath;
+            
+            // 監聽料件清單變化
+            database.ref(`${basePath}/productCatalog`).on('value', (snapshot) => {
+                const data = snapshot.val();
+                if(data){
+                    // 轉換為陣列並按 order 排序
+                    state.productCatalog = Object.values(data).sort((a, b) => (a.order || 0) - (b.order || 0));
+                    storage.set(`forti-product-catalog-${category}`, state.productCatalog);
+                    render();
+                    console.log(`📥 [${category}] 料件清單已更新（已排序）`);
+                }
+            });
+            
+            // 監聽訂單記錄變化
+            database.ref(`${basePath}/orderHistory`).on('value', (snapshot) => {
+                const data = snapshot.val();
+                if(data){
+                    state.orderHistory = Object.values(data);
+                    state.orderUpdateDate = new Date().toISOString();
+                    storage.set(`forti-order-history-${category}`, state.orderHistory);
+                    storage.set(`forti-order-update-${category}`, state.orderUpdateDate);
+                    render();
+                    console.log(`📥 [${category}] 訂單記錄已更新`);
+                }
+            });
+            
+            // 監聽歷史訂單存檔變化
+            database.ref(`${basePath}/orderHistoryArchive`).on('value', (snapshot) => {
+                const data = snapshot.val();
+                if(data){
+                    state.orderHistoryArchive = Object.values(data);
+                    storage.set(`forti-order-history-archive-${category}`, state.orderHistoryArchive);
+                    console.log(`📥 [${category}] 歷史訂單已更新（${state.orderHistoryArchive.length} 筆）`);
+                }
+            });
+        }
+        
+        // 切換類別時重新設定監聽器
+        function switchCategory(categoryId){
+            if(state.currentCategory === categoryId) return;
+            
+            // 移除舊的監聽器
+            if(firebaseInitialized){
+                const oldPath = CATEGORIES[state.currentCategory].firebasePath;
+                database.ref(`${oldPath}/productCatalog`).off();
+                database.ref(`${oldPath}/orderHistory`).off();
+                database.ref(`${oldPath}/orderHistoryArchive`).off();
+            }
+            
+            // 切換類別
+            state.currentCategory = categoryId;
+            
+            // 載入新類別的資料
+            loadCategoryData();
+            
+            // 設定新的監聽器
+            if(firebaseInitialized){
+                setupFirebaseListeners();
+            }
+            
+            render();
+        }
+        
+        async function syncToFirebase(type, data){
+            if(!firebaseInitialized){
+                console.log('Firebase 未初始化，資料僅保存在本地');
+                return;
+            }
+            
+            const category = state.currentCategory;
+            const basePath = CATEGORIES[category].firebasePath;
+            
+            try{
+                if(type === 'catalog'){
+                    const catalogObj = {};
+                    data.forEach((item, index) => {
+                        catalogObj[item.itemCode || `item_${index}`] = item;
+                    });
+                    await database.ref(`${basePath}/productCatalog`).set(catalogObj);
+                    console.log(`✅ [${category}] 料件清單已同步到 Firebase`);
+                }else if(type === 'orders'){
+                    const ordersObj = {};
+                    data.forEach((item, index) => {
+                        ordersObj[item.id || `order_${index}`] = item;
+                    });
+                    await database.ref(`${basePath}/orderHistory`).set(ordersObj);
+                    console.log(`✅ [${category}] 訂單記錄已同步到 Firebase`);
+                }else if(type === 'orderArchive'){
+                    const archiveObj = {};
+                    data.forEach((item, index) => {
+                        archiveObj[item.id || `archive_${index}`] = item;
+                    });
+                    await database.ref(`${basePath}/orderHistoryArchive`).set(archiveObj);
+                    console.log(`✅ [${category}] 歷史訂單已同步到 Firebase`);
+                }
+            }catch(error){
+                console.error('❌ Firebase 同步失敗:', error);
+                alert('雲端同步失敗，資料僅保存在本地\n錯誤：' + error.message);
+            }
+        }
+        
+        function loadCategoryData(){
+            const category = state.currentCategory;
+            state.productCatalog=storage.get(`forti-product-catalog-${category}`)||[];
+            state.supplierStock=storage.get(`forti-supplier-stock-${category}`)||[];
+            state.orderHistory=storage.get(`forti-order-history-${category}`)||[];
+            state.orderHistoryArchive=storage.get(`forti-order-history-archive-${category}`)||[];  // 載入歷史存檔
+            state.lastSyncDate=storage.get(`forti-last-sync-${category}`);
+            state.supplierUpdateDate=storage.get(`forti-supplier-update-${category}`);
+            state.orderUpdateDate=storage.get(`forti-order-update-${category}`);
+            
+            console.log(`📂 載入 [${category}] 類別資料:`, {
+                料件數: state.productCatalog.length,
+                訂單數: state.orderHistory.length,
+                歷史訂單數: state.orderHistoryArchive.length
+            });
+        }
+        
+        function loadData(){
+            // 載入當前類別
+            loadCategoryData();
+            
+            // 設定 Firebase 監聽器
+            if(firebaseInitialized){
+                setupFirebaseListeners();
+            }
+            
+            // 自動載入廠商庫存
+            if(state.productCatalog.length>0)autoLoadSupplierStock();
+        }
+        
+        function extractModel(name){
+            if(!name)return null;
+            name=name.toUpperCase();
+            
+            const category = state.currentCategory;
+            
+            // 網通產品（Fortinet）的型號識別規則
+            if(category === 'network'){
+                let match=name.match(/F[GS]-\d+[A-Z]?/i);
+                if(match)return match[0].toUpperCase();
+                match=name.match(/FORTISWITCH-(\d+[A-Z\-]+)/i);
+                if(match)return'FS-'+match[1].toUpperCase();
+                match=name.match(/FORTIAP-(\d+[A-Z]+)/i);
+                if(match)return'FAP-'+match[1].toUpperCase();
+                match=name.match(/FORTIWIFI-(\d+[A-Z]+)/i);
+                if(match)return'FWF-'+match[1].toUpperCase();
+                match=name.match(/FORTIGATE-(\d+[A-Z]+)/i);
+                if(match)return'FG-'+match[1].toUpperCase();
+                return null;
+            }
+            
+            // Server 類別硬體的型號識別規則（超精簡格式，控制在 10 字元內）
+            if(category === 'server'){
+                // 主機型號
+                if(name.includes('SR650V3'))return 'SR650V3';
+                if(name.match(/ST250\s*V\s*3/i))return 'ST250V3';
+                if(name.includes('T160'))return 'T160';
+                if(name.includes('SR650'))return 'SR650';
+                if(name.includes('ST250'))return 'ST250';
+                
+                // Nutanix 超精簡: NX-1175S-G9 → NX1175
+                let match = name.match(/NX-(\d+)/i);
+                if(match)return 'NX' + match[1];
+                
+                // Dell PowerEdge
+                match = name.match(/POWEREDGE\s+([TR]\d+)/i);
+                if(match)return match[1].toUpperCase();
+                
+                // Lenovo ThinkSystem: ThinkSystem SR650 → SR650
+                match = name.match(/THINKSYSTEM\s+(SR|ST)(\d+)/i);
+                if(match)return match[1].toUpperCase() + match[2];
+                
+                // NAS: DS725+ → DS725, TS-873AU → TS873
+                match = name.match(/DS(\d+)/i);
+                if(match)return 'DS' + match[1];
+                match = name.match(/TS-(\d+)/i);
+                if(match)return 'TS' + match[1];
+                
+                // Neo PC
+                match = name.match(/NEO\s+(\d+)[A-Z]?\s+GEN(\d+)/i);
+                if(match)return 'Neo' + match[1] + 'G' + match[2];
+                
+                // DGX 超精簡: DGX-Spark → DGX-Spk
+                if(name.includes('DGX'))return 'DGX-Spk';
+                
+                // 記憶體超精簡: HP16G-D4 (8字元)
+                if(name.includes('DDR') || name.includes('MEMORY')){
+                    const sizeMatch = name.match(/(\d+)GB/i);
+                    const ddrMatch = name.match(/DDR(\d)/i);
+                    
+                    if(sizeMatch && ddrMatch){
+                        const size = sizeMatch[1];
+                        const ddrVer = ddrMatch[1];
+                        
+                        let brand = '';
+                        if(name.includes('HPE') || name.match(/^HP\s/i))brand = 'HP';
+                        else if(name.includes('LENOVO') || name.includes('THINKSYSTEM'))brand = 'LN';
+                        else if(name.includes('IBM'))brand = 'IB';
+                        
+                        return brand ? brand + size + 'G-D' + ddrVer : size + 'G-D' + ddrVer;
+                    }
+                }
+                
+                // 硬碟超精簡: 品牌-容量-轉速-介面縮寫
+                if(name.includes('HDD') || name.includes('SSD') || name.includes('DISK') || name.includes('DRIVE')){
+                    let size = '';
+                    let sizeMatch = name.match(/(\d+\.?\d*)TB/i);
+                    if(sizeMatch){
+                        const tb = parseFloat(sizeMatch[1]);
+                        size = (tb === Math.floor(tb)) ? Math.floor(tb) + 'T' : tb.toFixed(1) + 'T';
+                    }else{
+                        sizeMatch = name.match(/(\d+)GB/i);
+                        if(sizeMatch){
+                            const gb = parseInt(sizeMatch[1]);
+                            size = gb >= 1000 ? Math.floor(gb/1000) + 'T' : gb + 'G';
+                        }
+                    }
+                    
+                    const rpmMatch = name.match(/(\d+)K/i);
+                    const rpm = rpmMatch ? rpmMatch[1] + 'K' : '';
+                    
+                    // 介面縮寫: SAS→SA, SATA→ST
+                    let iface = '';
+                    if(name.includes('SAS'))iface = 'SA';
+                    else if(name.includes('SATA'))iface = 'ST';
+                    
+                    let brand = '';
+                    if(name.includes('HPE'))brand = 'HPE';
+                    else if(name.match(/^HP\s/i))brand = 'HP';
+                    else if(name.includes('IBM'))brand = 'IB';
+                    else if(name.includes('ASUS'))brand = 'AS';
+                    
+                    const parts = [brand, size, rpm, iface].filter(p => p);
+                    return parts.length > 0 ? parts.join('-') : 'HDD';
+                }
+                
+                // 電源超精簡: HP500W (6字元)
+                if(name.includes('POWER') || name.includes('PWR')){
+                    const wattMatch = name.match(/(\d+)W/i);
+                    const watt = wattMatch ? wattMatch[1] + 'W' : 'PSU';
+                    
+                    let brand = '';
+                    if(name.includes('HPE') || name.match(/^HP\s/i))brand = 'HP';
+                    else if(name.includes('DELL'))brand = 'DL';
+                    
+                    return brand ? brand + watt : watt;
+                }
+                
+                // 網卡超精簡: FC16G (5字元), ETH10G (6字元)
+                if(name.includes('ETHERNET') || name.includes('NETWORK') || name.includes('HBA')){
+                    const speedMatch = name.match(/(\d+)GB/i);
+                    const speed = speedMatch ? speedMatch[1] + 'G' : 'NIC';
+                    
+                    if(name.includes('FC'))return 'FC' + speed;
+                    else return 'ETH' + speed;
+                }
+                
+                // 其他：使用品名前 10 字
+                const cleanName = name.replace(/<.*?>/g, '').replace(/\(.*?\)/g, '').trim();
+                return cleanName.substring(0, 10);
+            }
+            
+            // Client 硬體的型號識別規則（待補充）
+            if(category === 'client'){
+                // TODO: 添加 PC、NB、Monitor 等型號識別規則
+                return null;
+            }
+            
+            return null;
+        }
+        
+        function getMergedInventory(){
+            const category = state.currentCategory;
+            const isNetwork = category === 'network';
+            
+            const modelOrderTotals={};
+            state.productCatalog.forEach(p=>{
+                if(p.model && !modelOrderTotals[p.model]){modelOrderTotals[p.model]=0;}
+            });
+            state.orderHistory.forEach(order=>{
+                const product=state.productCatalog.find(p=>p.itemCode===order.itemCode);
+                if(product&&product.model){modelOrderTotals[product.model]+=order.quantity;}
+            });
+            
+            return state.productCatalog.map(p=>{
+                let stockQty = null;
+                let remainingQty = null;
+                
+                if(isNetwork){
+                    // 網通產品：使用廠商庫存（型號對應）
+                    const s=state.supplierStock.find(x=>x.model===p.model);
+                    stockQty=s?.quantity??null;
+                    
+                    // 網通產品的剩餘：庫存 - 型號總下單
+                    const modelTotalOrdered=(p.model && modelOrderTotals[p.model]) || 0;
+                    remainingQty=stockQty!==null?stockQty-modelTotalOrdered:null;
+                }else{
+                    // Server/Client：每個料號獨立的手動庫存
+                    stockQty = p.manualStock !== undefined && p.manualStock !== null ? p.manualStock : null;
+                    
+                    // Server/Client 的剩餘：庫存 - 此料號已下單（不是型號總下單）
+                    const orderedQty=state.orderHistory.filter(o=>o.itemCode===p.itemCode).reduce((sum,o)=>sum+o.quantity,0);
+                    remainingQty=stockQty!==null?stockQty-orderedQty:null;
+                }
+                
+                const orderedQty=state.orderHistory.filter(o=>o.itemCode===p.itemCode).reduce((sum,o)=>sum+o.quantity,0);
+                const modelTotalOrdered=(p.model && modelOrderTotals[p.model]) || 0;
+                const s=state.supplierStock.find(x=>x.model===p.model);
+                
+                return{
+                    ...p,
+                    stockQty:stockQty,
+                    orderedQty:orderedQty,
+                    modelTotalOrdered:modelTotalOrdered,
+                    remainingQty:remainingQty,
+                    inTransit:s?.inTransit||'',
+                    stockNotes:s?.notes||'',
+                    stockUpdateTime: p.stockUpdateTime || null  // 保留時間戳記
+                };
+            });
+        }
+        
+        async function autoLoadSupplierStock(){
+            if(state.autoLoading)return;
+            
+            const category = state.currentCategory;
+            const csvUrl = CATEGORIES[category].csvUrl;
+            
+            if(!csvUrl){
+                console.log(`⚠️ [${category}] 類別尚未設定 CSV 來源`);
+                return;
+            }
+            
+            state.autoLoading=true;
+            render();
+            try{
+                console.log(`🔄 [${category}] 開始載入廠商庫存...`);
+                const response=await fetch(csvUrl);
+                if(!response.ok)throw new Error('無法載入CSV');
+                const csvText=await response.text();
+                console.log(`✅ [${category}] CSV 載入成功，長度:`, csvText.length);
+                
+                const lines=csvText.trim().split('\n');
+                console.log(`📊 [${category}] CSV 共`, lines.length, '行');
+                
+                const stock=[];
+                
+                // 從第一行的 F 欄（索引 5）提取更新日期
+                const firstLine=lines[0];
+                console.log('🔍 第一行原始內容:', firstLine);
+                
+                const firstCells=firstLine.match(/(".*?"|[^,]+)(?=\s*,|\s*$)/g)||[];
+                const cleanFirstCells=firstCells.map(s=>s.replace(/^"|"$/g,'').trim());
+                
+                console.log('📋 第一行欄位數量:', cleanFirstCells.length);
+                cleanFirstCells.forEach((cell, index) => {
+                    console.log(`   ${String.fromCharCode(65+index)} 欄 (索引 ${index}): [${cell}]`);
+                });
+                
+                let supplierDate=cleanFirstCells[5]||null;  // F 欄（索引 5）
+                
+                // 去除「更新日期:」前綴，只保留日期部分
+                if(supplierDate){
+                    supplierDate = supplierDate.replace(/^更新日期[:：]\s*/i, '').trim();
+                    console.log('📅 處理後的日期:', supplierDate);
+                }
+                
+                console.log('📅 F 欄內容 (索引 5):', supplierDate);
+                
+                // 從第二行開始讀取資料
+                for(let i=1;i<lines.length;i++){
+                    const cells=lines[i].match(/(".*?"|[^,]+)(?=\s*,|\s*$)/g)||[];
+                    const cleanCells=cells.map(s=>s.replace(/^"|"$/g,'').trim());
+                    const model=cleanCells[0];      // A 欄：型號
+                    const stockStr=cleanCells[1];   // B 欄：庫存
+                    const inTransit=cleanCells[2]||'';  // C 欄：在途
+                    const notes=cleanCells[4]||'';      // E 欄：備註
+                    if(model&&stockStr&&model!=='型號'){
+                        const quantity=parseInt(stockStr)||0;
+                        stock.push({id:`${model}-${Date.now()}-${i}`,model:model,quantity:quantity,inTransit:inTransit,notes:notes});
+                    }
+                }
+                
+                console.log(`✅ [${category}] 解析完成，共`, stock.length, '項產品');
+                
+                if(stock.length>0){
+                    state.supplierStock=stock;
+                    storage.set(`forti-supplier-stock-${category}`,stock);
+                    state.lastSyncDate=new Date().toISOString();
+                    storage.set(`forti-last-sync-${category}`,state.lastSyncDate);
+                    if(supplierDate){
+                        state.supplierUpdateDate=supplierDate;
+                        storage.set(`forti-supplier-update-${category}`,supplierDate);
+                        console.log(`✅ [${category}] 更新日期已設定:`, supplierDate);
+                    }else{
+                        console.warn(`⚠️ [${category}] F 欄沒有日期資料`);
+                    }
+                    console.log(`✅ [${category}] 廠商庫存載入成功：`+stock.length+' 項');
+                    alert(`✅ 成功自動載入 [${CATEGORIES[category].name}] 廠商庫存：`+stock.length+' 項\n更新日期：'+(supplierDate||'未找到'));
+                    render();
+                }else{
+                    alert('無法解析CSV資料');
+                }
+            }catch(error){
+                console.error('❌ 載入失敗:', error);
+                alert('自動載入失敗：'+error.message);
+            }finally{
+                state.autoLoading=false;
+                render();
+            }
+        }
+        
+        function handleStockSync(){
+            if(confirm('確定要重新載入廠商庫存嗎？\n這會從 Google Sheets 抓取最新資料。')){
+                autoLoadSupplierStock();
+            }
+        }
+        
+        function handleCatalogExcelUpload(e){
+            const file=e.target.files[0];
+            if(!file)return;
+            const reader=new FileReader();
+            reader.onload=function(event){
+                try{
+                    const data=new Uint8Array(event.target.result);
+                    const workbook=XLSX.read(data,{type:'array',codepage:65001});
+                    const firstSheet=workbook.Sheets[workbook.SheetNames[0]];
+                    const jsonData=XLSX.utils.sheet_to_json(firstSheet,{header:1,raw:false,defval:''});
+                    processCatalogExcelData(jsonData);
+                }catch(error){
+                    alert('Excel檔案讀取失敗：'+error.message);
+                }
+            };
+            reader.readAsArrayBuffer(file);
+            e.target.value='';
+        }
+        
+        function processCatalogExcelData(data){
+            const existingCatalog=state.productCatalog;
+            const newItems=[];
+            const updatedItems=[];
+            const skippedItems=[];
+            const filteredItems=[];  // 被過濾掉的項目
+            const existingItemCodes=new Set(existingCatalog.map(p=>p.itemCode));
+            for(let i=1;i<data.length;i++){
+                const row=data[i];
+                let itemCode=row[0];
+                let productName=row[1];
+                const specs=(row.length>7?row[7]:'')||'';
+                if(typeof itemCode==='string')itemCode=itemCode.trim();
+                else if(itemCode)itemCode=String(itemCode).trim();
+                if(typeof productName==='string')productName=productName.trim();
+                else if(productName)productName=String(productName).trim();
+                
+                // 先確定最終料號
+                let finalItemCode;
+                let isUnregistered = false;  // 標記是否為未申請
+                
+                // 判斷是否為未申請：空白、空字串、「料號」、或「未申請」
+                if(!itemCode || itemCode==='' || itemCode==='料號' || itemCode==='未申請'){
+                    finalItemCode=`未申請-${Date.now()}-${i}`;
+                    isUnregistered = true;
+                }else{
+                    finalItemCode=itemCode;
+                }
+                
+                // ========== 自動過濾規則 ==========
+                // Server 類別：過濾 T 開頭料號（代理商維護）
+                if(state.currentCategory === 'server'){
+                    if(!isUnregistered && itemCode && itemCode !== '' && itemCode !== '料號'){
+                        if(itemCode.toUpperCase().startsWith('T')){
+                            filteredItems.push({itemCode: itemCode, reason: 'T開頭（代理商維護）'});
+                            continue;  // 跳過此項目
+                        }
+                    }
+                }
+                
+                // 網通產品：過濾 S 開頭料號（未申請的料號不過濾）
+                if(state.currentCategory === 'network'){
+                    if(!isUnregistered && itemCode && itemCode !== '' && itemCode !== '料號'){
+                        // 規則 1：過濾 S 開頭的料號（僅針對正常料號）
+                        if(itemCode.toUpperCase().startsWith('S')){
+                            filteredItems.push({itemCode: itemCode, reason: 'S品號'});
+                            continue;  // 跳過此項目
+                        }
+                    }
+                }
+                
+                // 規則 2：過濾包含「(僅電子授權)」的品名（所有類別都檢查）
+                if(productName && productName.includes('(僅電子授權)')){
+                    filteredItems.push({itemCode: finalItemCode, reason: '僅電子授權'});
+                    continue;  // 跳過此項目
+                }
+                // ================================
+                
+                if(!productName||productName===''||productName==='品名'){
+                    continue;
+                }
+                const model=extractModel(productName);
+                if(existingItemCodes.has(finalItemCode)){
+                    skippedItems.push(finalItemCode);
+                    continue;
+                }
+                const newItem={id:`${finalItemCode}-${Date.now()}-${i}`,itemCode:finalItemCode,productName,model,specs:specs||'',notes:'',order:i};
+                newItems.push(newItem);
+                if(!finalItemCode.startsWith('未申請')){
+                    existingItemCodes.add(finalItemCode);
+                }
+            }
+            const mergedCatalog=[...existingCatalog,...newItems];
+            if(newItems.length>0||updatedItems.length>0||filteredItems.length>0){
+                if(newItems.length>0){
+                    state.productCatalog=mergedCatalog;
+                    storage.set('forti-product-catalog',mergedCatalog);
+                    
+                    // 🔥 即時同步到 Firebase
+                    syncToFirebase('catalog', mergedCatalog);
+                }
+                
+                let message='料件維護完成！\n';
+                message+=`新增：${newItems.length} 項\n`;
+                message+=`略過重複：${skippedItems.length} 項\n`;
+                if(filteredItems.length>0){
+                    message+=`🚫 自動過濾：${filteredItems.length} 項\n`;
+                }
+                message+=`總計：${mergedCatalog.length} 項\n\n`;
+                
+                if(firebaseInitialized){
+                    message+='✅ 已同步到雲端，所有人即時可見';
+                }else{
+                    message+='⚠️ 資料僅保存在本地（Firebase 未設定）';
+                }
+                
+                // 顯示過濾的項目
+                if(filteredItems.length>0){
+                    message+='\n\n🚫 自動過濾的項目：';
+                    filteredItems.slice(0,5).forEach(item=>{
+                        message+=`\n• ${item.itemCode} (${item.reason})`;
+                    });
+                    if(filteredItems.length>5){
+                        message+=`\n...等 ${filteredItems.length} 項`;
+                    }
+                    message+='\n\n過濾規則：\n• S開頭的料號\n• 包含「(僅電子授權)」的品名';
+                }
+                
+                if(skippedItems.length>0&&skippedItems.length<=5){
+                    message+='\n\n略過的料號：\n'+skippedItems.join('\n');
+                }else if(skippedItems.length>5){
+                    message+='\n\n略過的料號：\n'+skippedItems.slice(0,5).join('\n')+'\n...等'+skippedItems.length+'項';
+                }
+                alert(message);
+                render();
+            }else{
+                alert('未能匯入任何料件');
+            }
+        }
+        
+        function handleExcelUpload(e){
+            const file=e.target.files[0];
+            if(!file)return;
+            const reader=new FileReader();
+            reader.onload=function(event){
+                try{
+                    const data=new Uint8Array(event.target.result);
+                    const workbook=XLSX.read(data,{type:'array',codepage:65001});
+                    const firstSheet=workbook.Sheets[workbook.SheetNames[0]];
+                    const jsonData=XLSX.utils.sheet_to_json(firstSheet,{header:1,raw:false,defval:''});
+                    processExcelData(jsonData);
+                }catch(error){
+                    alert('Excel檔案讀取失敗：'+error.message);
+                }
+            };
+            reader.readAsArrayBuffer(file);
+            e.target.value='';
+        }
+        
+        // 新增：統一的日期處理函數
+        function parseExcelDate(dateValue, rowIndex){
+            if(!dateValue) return '';
+            
+            // 處理 Date 物件（Excel 日期格式）
+            if(typeof dateValue === 'object' && dateValue instanceof Date){
+                const year = dateValue.getFullYear();
+                const month = String(dateValue.getMonth() + 1).padStart(2, '0');
+                const day = String(dateValue.getDate()).padStart(2, '0');
+                const result = `${year}/${month}/${day}`;
+                if(rowIndex >= 78 && rowIndex <= 82) console.log(`    parseExcelDate: Date物件 ${dateValue} → ${result}`);
+                return result;
+            }
+            
+            // 處理 Excel 序列數字格式
+            if(typeof dateValue === 'number'){
+                const excelDate = new Date((dateValue - 25569) * 86400 * 1000);
+                const year = excelDate.getFullYear();
+                const month = String(excelDate.getMonth() + 1).padStart(2, '0');
+                const day = String(excelDate.getDate()).padStart(2, '0');
+                const result = `${year}/${month}/${day}`;
+                if(rowIndex >= 78 && rowIndex <= 82) console.log(`    parseExcelDate: 數字 ${dateValue} → Date ${excelDate} → ${result}`);
+                return result;
+            }
+            
+            // 處理字串格式
+            const dateStr = dateValue.toString().trim();
+            if(!dateStr) return '';
+            
+            // 優先匹配 4 位數年份格式：YYYY/MM/DD 或 YYYY-MM-DD
+            let match = dateStr.match(/(\d{4})[\/-](\d{1,2})[\/-](\d{1,2})/);
+            if(match){
+                const result = `${match[1]}/${match[2].padStart(2,'0')}/${match[3].padStart(2,'0')}`;
+                if(rowIndex >= 78 && rowIndex <= 82) console.log(`    parseExcelDate: 字串 "${dateStr}" → 4位年份 ${JSON.stringify(match.slice(1))} → ${result}`);
+                return result;
+            }
+            
+            // 匹配 2 位數年份格式：M/D/YY 或 M-D-YY
+            match = dateStr.match(/(\d{1,2})[\/-](\d{1,2})[\/-](\d{2})/);
+            if(match){
+                // 將 2 位數年份轉換為 4 位數（20-99 → 1920-1999, 00-19 → 2000-2019, 20-99 → 2020-2099）
+                let year = parseInt(match[3]);
+                if(year >= 0 && year <= 99){
+                    year = year >= 20 ? 2000 + year : 2000 + year;  // 20-99 → 2020-2099, 00-19 → 2000-2019
+                }
+                const result = `${year}/${match[1].padStart(2,'0')}/${match[2].padStart(2,'0')}`;
+                if(rowIndex >= 78 && rowIndex <= 82) console.log(`    parseExcelDate: 字串 "${dateStr}" → 2位年份 ${JSON.stringify(match.slice(1))} → ${result}`);
+                return result;
+            }
+            
+            if(rowIndex >= 78 && rowIndex <= 82) console.log(`    parseExcelDate: 無法解析 "${dateStr}"，返回原值`);
+            return dateStr;  // 無法解析則返回原值
+        }
+        
+        function processExcelData(data){
+            console.log('\n🔍 Excel 檔案總行數（含標題）:', data.length);
+            console.log('🔍 資料行數（不含標題）:', data.length - 1);
+            
+            const merged=getMergedInventory();
+            let successCount=0;
+            let duplicateCount=0;
+            let outdatedCount=0;  // 新增：過期訂單數量
+            let failedItems=[];
+            const duplicateOrders=[];
+            const outdatedOrders=[];  // 新增：過期訂單列表
+            
+            // 建立現有訂單的唯一鍵集合（採購單號 + 訂單單號 + 料號）
+            const existingOrderKeys = new Set(
+                state.orderHistory.map(o => `${o.poNumber}_${o.orderNumber}_${o.itemCode}`)
+            );
+            
+            // 取得廠商更新日期（字串格式即可）
+            const supplierUpdateDate = state.supplierUpdateDate;
+            
+            console.log('📅 廠商庫存更新日期:', supplierUpdateDate || '未設定');
+            
+            for(let i=1;i<data.length;i++){
+                const row=data[i];
+                const orderDateStr=parseExcelDate(row[1], i);        // B欄（索引1）：下單日期（使用新的解析函數）
+                const poNumber=row[8]?.toString().trim()||'';     // I欄（索引8）：採購單號
+                const itemCode=row[9]?.toString().trim();         // J欄（索引9）：料號
+                const productName=row[10];                        // K欄（索引10）：採購品項
+                const quantity=parseInt(row[11]);                 // L欄（索引11）：數量
+                const orderNumber=row[15]?.toString().trim()||''; // P欄（索引15）：訂單單號
+                
+                // 詳細除錯（第 78-82 筆）
+                if(i >= 78 && i <= 82){
+                    console.log(`\n━━━ 第 ${i} 筆資料 (Excel 第 ${i+1} 行) ━━━`);
+                    console.log('  B欄原始值:', row[1]);
+                    console.log('  解析後日期:', orderDateStr);
+                    console.log('  料號 (J欄):', itemCode);
+                    console.log('  數量 (L欄):', quantity);
+                    console.log('  採購單號 (I欄):', poNumber);
+                    console.log('  訂單單號 (P欄):', orderNumber);
+                }
+                
+                // 基本驗證
+                if(!itemCode||!quantity||isNaN(quantity)){
+                    if(i >= 78 && i <= 82) console.log('  ❌ 跳過：料號或數量無效');
+                    continue;
+                }
+                
+                // ========== 日期比對邏輯 ==========
+                // 如果有廠商更新日期，檢查下單日期是否早於廠商更新日期
+                if(supplierUpdateDate && orderDateStr){
+                    try{
+                        // 將兩個日期都轉換為 YYYYMMDD 格式的數字進行比對
+                        // 例如：2026/01/09 → 20260109
+                        const orderParts = orderDateStr.toString().split(/[\/\-]/);
+                        const supplierParts = supplierUpdateDate.split(/[\/\-]/);
+                        
+                        if(orderParts.length === 3 && supplierParts.length === 3){
+                            // 轉換為 YYYYMMDD 數字格式
+                            const orderDateNum = parseInt(orderParts[0]) * 10000 + 
+                                                parseInt(orderParts[1]) * 100 + 
+                                                parseInt(orderParts[2]);
+                            const supplierDateNum = parseInt(supplierParts[0]) * 10000 + 
+                                                   parseInt(supplierParts[1]) * 100 + 
+                                                   parseInt(supplierParts[2]);
+                            
+                            // 詳細除錯（第 78-82 筆）
+                            if(i >= 78 && i <= 82){
+                                console.log('  日期比對:');
+                                console.log('    訂單日期字串:', orderDateStr, '→ 部分:', orderParts, '→ 數字:', orderDateNum);
+                                console.log('    廠商日期字串:', supplierUpdateDate, '→ 部分:', supplierParts, '→ 數字:', supplierDateNum);
+                                console.log('    是否過期?', orderDateNum < supplierDateNum, '(', orderDateNum, '<', supplierDateNum, ')');
+                            }
+                            
+                            // 如果下單日期 < 廠商更新日期，跳過此訂單
+                            if(orderDateNum < supplierDateNum){
+                                outdatedCount++;
+                                outdatedOrders.push({
+                                    itemCode: itemCode,
+                                    poNumber: poNumber,
+                                    orderNumber: orderNumber,
+                                    orderDate: orderDateStr,
+                                    quantity: quantity
+                                });
+                                if(i >= 78 && i <= 82) console.log('  ⏰ 標記為過期訂單');
+                                continue;  // 跳過此訂單
+                            }
+                        }
+                    }catch(e){
+                        console.warn('⚠️ 無法解析下單日期:', orderDateStr, e);
+                    }
+                }
+                // ================================
+                
+                // 建立唯一鍵（採購單號_訂單單號_料號）
+                const orderKey = `${poNumber}_${orderNumber}_${itemCode}`;
+                
+                // 檢查是否重複
+                if(existingOrderKeys.has(orderKey)){
+                    duplicateCount++;
+                    duplicateOrders.push({
+                        itemCode: itemCode,
+                        poNumber: poNumber,
+                        orderNumber: orderNumber,
+                        quantity: quantity
+                    });
+                    if(i >= 78 && i <= 82) console.log('  ⚠️ 跳過：訂單重複');
+                    continue;  // 跳過重複的訂單
+                }
+                
+                // 檢查料號是否存在
+                const product=merged.find(p=>p.itemCode===itemCode);
+                if(product){
+                    if(i >= 78 && i <= 82) console.log('  ✅ 找到料號，準備加入訂單');
+                    const order={
+                        id:Date.now()+i,
+                        itemCode:itemCode,
+                        productName:productName||product.productName,
+                        model:product.model,
+                        quantity:quantity,
+                        poNumber:poNumber,          // I欄：採購單號
+                        orderNumber:orderNumber,    // P欄：訂單單號
+                        orderDate:orderDateStr,     // B欄：下單日期（新增）
+                        notes:'批次匯入-'+(orderDateStr||''),
+                        timestamp:new Date().toISOString()
+                    };
+                    state.orderHistory.push(order);
+                    existingOrderKeys.add(orderKey);  // 加入已處理的訂單
+                    successCount++;
+                }else{
+                    if(i >= 78 && i <= 82) console.log('  ❌ 找不到料號:', itemCode);
+                    failedItems.push(itemCode);
+                }
+            }
+            
+            if(successCount>0||duplicateCount>0||outdatedCount>0){
+                if(successCount>0){
+                    state.orderUpdateDate=new Date().toISOString();
+                    storage.set('forti-order-history',state.orderHistory);
+                    storage.set('forti-order-update',state.orderUpdateDate);
+                    
+                    // 🔥 即時同步到 Firebase
+                    syncToFirebase('orders', state.orderHistory);
+                }
+                
+                let message='訂單匯入完成！\n\n';
+                message+=`✅ 成功匯入：${successCount} 筆\n`;
+                if(duplicateCount>0){
+                    message+=`⚠️ 略過重複：${duplicateCount} 筆\n`;
+                }
+                if(outdatedCount>0){
+                    message+=`⏰ 略過過期：${outdatedCount} 筆\n`;
+                }
+                if(failedItems.length>0){
+                    message+=`❌ 找不到料號：${failedItems.length} 筆\n`;
+                }
+                message+=`📊 總訂單數：${state.orderHistory.length} 筆\n`;
+                
+                if(supplierUpdateDate){
+                    message+=`\n📅 廠商庫存更新日期：${supplierUpdateDate}`;
+                    message+=`\n   只計算 ${supplierUpdateDate} (含) 之後的訂單`;
+                }
+                
+                if(firebaseInitialized){
+                    message+='\n\n✅ 已同步到雲端，所有人即時可見';
+                }else{
+                    message+='\n\n⚠️ 資料僅保存在本地（Firebase 未設定）';
+                }
+                
+                // 顯示過期訂單的詳細資訊（最多顯示5筆）
+                if(outdatedCount>0&&outdatedOrders.length>0){
+                    message+='\n\n⏰ 過期訂單（已略過）：';
+                    outdatedOrders.slice(0,5).forEach(o=>{
+                        message+=`\n• ${o.orderDate} | PO:${o.poNumber} | ${o.itemCode} x${o.quantity}`;
+                    });
+                    if(outdatedOrders.length>5){
+                        message+=`\n...等 ${outdatedOrders.length} 筆`;
+                    }
+                    message+=`\n\n說明：這些訂單的下單日期早於廠商庫存更新日期`;
+                    message+=`\n已到貨或已包含在新庫存中，不重複計算`;
+                }
+                
+                // 顯示重複訂單的詳細資訊（最多顯示5筆）
+                if(duplicateCount>0&&duplicateOrders.length>0){
+                    message+='\n\n⚠️ 重複的訂單（已略過）：';
+                    duplicateOrders.slice(0,5).forEach(o=>{
+                        message+=`\n• PO:${o.poNumber} | 訂單:${o.orderNumber} | ${o.itemCode} x${o.quantity}`;
+                    });
+                    if(duplicateOrders.length>5){
+                        message+=`\n...等 ${duplicateOrders.length} 筆`;
+                    }
+                }
+                
+                // 顯示找不到的料號
+                if(failedItems.length>0){
+                    message+='\n\n❌ 找不到以下料號：\n'+failedItems.slice(0,5).join(', ');
+                    if(failedItems.length>5){
+                        message+=`\n...等 ${failedItems.length} 項`;
+                    }
+                }
+                
+                alert(message);
+                render();
+            }else{
+                alert('未能匯入任何訂單\n\n可能原因：\n• 所有訂單都已存在（重複）\n• 所有訂單都早於廠商庫存更新日期（過期）\n• 找不到對應的料號');
+            }
+        }
+        
+        function viewOrderDetails(itemCode){
+            // 合併當前訂單和歷史存檔
+            const currentOrders = state.orderHistory.filter(o => o.itemCode === itemCode);
+            const archivedOrders = (state.orderHistoryArchive || []).filter(o => o.itemCode === itemCode);
+            const allOrders = [...currentOrders, ...archivedOrders];
+            
+            if(allOrders.length === 0){
+                alert('此料號沒有訂單記錄');
+                return;
+            }
+            
+            let message = `料號：${itemCode}\n`;
+            const product = state.productCatalog.find(p => p.itemCode === itemCode);
+            if(product) message += `品名：${product.productName}\n`;
+            message += `\n📊 訂單統計\n`;
+            message += `  當前週期：${currentOrders.length} 筆（統計中）\n`;
+            message += `  歷史記錄：${archivedOrders.length} 筆（已歸檔）\n`;
+            message += `  總計：${allOrders.length} 筆\n`;
+            message += '='.repeat(60) + '\n\n';
+            
+            // 按時間倒序排列（最新的在上面）
+            const sortedOrders = [...allOrders].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+            
+            sortedOrders.forEach((order, index) => {
+                const isArchived = archivedOrders.find(o => o.id === order.id);
+                message += `${index + 1}. `;
+                if(isArchived) message += `[已歸檔] `;
+                message += `下單日期：${order.notes.replace('批次匯入-', '') || '未知'}\n`;
+                message += `   採購單號：${order.poNumber || '無'} | 訂單單號：${order.orderNumber || '無'}\n`;
+                message += `   數量：${order.quantity} | 型號：${order.model || '未知'}\n`;
+                message += `   匯入時間：${new Date(order.timestamp).toLocaleString('zh-TW')}\n\n`;
+            });
+            
+            alert(message);
+        }
+        
+        function toggleOrderManager(){
+            state.showOrderManager = !state.showOrderManager;
+            render();
+        }
+        
+        function exportOrdersCSV(){
+            if(state.orderHistory.length === 0){
+                alert('沒有訂單記錄可匯出');
+                return;
+            }
+            
+            let csv = '料號,品名,型號,數量,採購單號,訂單單號,下單日期,匯入時間\n';
+            state.orderHistory.forEach(order => {
+                const orderDate = order.notes.replace('批次匯入-', '') || '';
+                csv += `"${order.itemCode}","${order.productName}","${order.model}",${order.quantity},"${order.poNumber}","${order.orderNumber}","${orderDate}","${new Date(order.timestamp).toLocaleString('zh-TW')}"\n`;
+            });
+            
+            const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement('a');
+            const url = URL.createObjectURL(blob);
+            link.setAttribute('href', url);
+            link.setAttribute('download', `訂單記錄_${new Date().toISOString().split('T')[0]}.csv`);
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        }
+        
+        function clearAllOrders(){
+            if(confirm('⚠️ 警告：此操作將清除所有採購訂單記錄！\n\n✅ 已下單數量將被清零\n✅ 但歷史記錄會保留（可點擊查看）\n\n確定要繼續嗎？')){
+                if(confirm('再次確認：真的要清除所有訂單嗎？\n\n• 當前統計會被清零\n• 歷史記錄會被保留')){
+                    const category = state.currentCategory;
+                    
+                    // 將當前訂單歸檔到歷史存檔
+                    if(state.orderHistory.length > 0){
+                        // 合併到歷史存檔（避免重複）
+                        const existingArchive = state.orderHistoryArchive || [];
+                        const newArchive = [...existingArchive, ...state.orderHistory];
+                        
+                        // 去重（根據 id）
+                        const uniqueArchive = newArchive.reduce((acc, order) => {
+                            if(!acc.find(o => o.id === order.id)){
+                                acc.push(order);
+                            }
+                            return acc;
+                        }, []);
+                        
+                        state.orderHistoryArchive = uniqueArchive;
+                        storage.set(`forti-order-history-archive-${category}`, uniqueArchive);
+                        
+                        if(firebaseInitialized){
+                            syncToFirebase('orderArchive', uniqueArchive);
+                        }
+                    }
+                    
+                    // 清除當前訂單（統計用）
+                    state.orderHistory=[];
+                    state.orderUpdateDate=null;
+                    storage.set(`forti-order-history-${category}`,[]);
+                    storage.set(`forti-order-update-${category}`,null);
+                    
+                    if(firebaseInitialized){
+                        const basePath = CATEGORIES[category].firebasePath;
+                        database.ref(`${basePath}/orderHistory`).remove();
+                    }
+                    
+                    alert('✓ 已清除所有訂單記錄\n✓ 歷史記錄已保留（共 ' + state.orderHistoryArchive.length + ' 筆）');
+                    render();
+                }
+            }
+        }
+        
+        function clearAllCatalog(){
+            if(confirm('⚠️ 警告：此操作將清除所有料件資料！\n\n確定要繼續嗎？')){
+                if(confirm('再次確認：真的要清除所有料件嗎？\n此操作無法復原！')){
+                    state.productCatalog=[];
+                    storage.set('forti-product-catalog',[]);
+                    if(firebaseInitialized){
+                        database.ref('productCatalog').remove();
+                    }
+                    alert('✓ 已清除所有料件資料');
+                    render();
+                }
+            }
+        }
+        
+        function updateNotes(itemCode,notes){
+            const category = state.currentCategory;
+            state.productCatalog=state.productCatalog.map(item=>item.itemCode===itemCode?{...item,notes:notes}:item);
+            storage.set(`forti-product-catalog-${category}`,state.productCatalog);
+            if(firebaseInitialized){
+                syncToFirebase('catalog', state.productCatalog);
+            }
+        }
+        
+        function updateStock(itemCode, value){
+            const category = state.currentCategory;
+            const stockQty = value === '' ? null : parseInt(value);
+            const updateTime = new Date().toISOString();
+            
+            // 更新料件清單中的庫存和時間戳記
+            state.productCatalog = state.productCatalog.map(item => 
+                item.itemCode === itemCode ? {
+                    ...item, 
+                    manualStock: stockQty,
+                    stockUpdateTime: updateTime
+                } : item
+            );
+            
+            // Server/Client 不使用 supplierStock，每個料號的庫存都獨立存在 productCatalog 中
+            // 這樣就不會有連動問題
+            
+            // 保存到 localStorage
+            storage.set(`forti-product-catalog-${category}`, state.productCatalog);
+            
+            // 同步到 Firebase
+            if(firebaseInitialized){
+                syncToFirebase('catalog', state.productCatalog);
+            }
+            
+            render();
+        }
+        
+        // 格式化時間顯示（相對時間或絕對時間）
+        function formatTime(isoString){
+            if(!isoString) return '';
+            
+            const date = new Date(isoString);
+            const now = new Date();
+            const diffMs = now - date;
+            const diffMins = Math.floor(diffMs / 60000);
+            const diffHours = Math.floor(diffMs / 3600000);
+            const diffDays = Math.floor(diffMs / 86400000);
+            
+            if(diffMins < 1) return '剛剛';
+            if(diffMins < 60) return `${diffMins}分鐘前`;
+            if(diffHours < 24) return `${diffHours}小時前`;
+            if(diffDays < 7) return `${diffDays}天前`;
+            
+            // 超過7天顯示日期
+            return date.toLocaleDateString('zh-TW', {month:'numeric', day:'numeric'});
+        }
+        
+        function forceCheckUpdate(){
+            console.log('🔄 手動檢查更新...');
+            console.log('當前版本:', APP_VERSION);
+            
+            // 強制重新載入（帶時間戳記，繞過快取）
+            const timestamp = Date.now();
+            window.location.href = window.location.pathname + '?v=' + APP_VERSION + '&t=' + timestamp;
+        }
+        
+        function toggleClearMenu(event){
+            if(event){
+                event.stopPropagation();  // 阻止事件冒泡
+            }
+            const menu = document.getElementById('clearMenu');
+            if(menu){
+                menu.classList.toggle('hidden');
+            }
+        }
+        
+        // 點擊其他地方關閉選單
+        document.addEventListener('click', function(event){
+            const menu = document.getElementById('clearMenu');
+            if(!menu) return;
+            
+            const clearButton = event.target.closest('button[onclick*="toggleClearMenu"]');
+            if(!clearButton && !menu.contains(event.target)){
+                menu.classList.add('hidden');
+            }
+        });
+        
+        function clearUploadedOrders(){
+            if(confirm('⚠️ 確定要清除所有已下單數量嗎？\n\n此操作會：\n• 清除所有訂單記錄\n• 保留料件資料\n• 保留廠商庫存\n• 保留歷史記錄（可查看）\n\n通常在每週四庫存更新後執行')){
+                const category = state.currentCategory;
+                
+                // 將當前訂單歸檔到歷史存檔
+                if(state.orderHistory.length > 0){
+                    const existingArchive = state.orderHistoryArchive || [];
+                    const newArchive = [...existingArchive, ...state.orderHistory];
+                    
+                    // 去重（根據 id）
+                    const uniqueArchive = newArchive.reduce((acc, order) => {
+                        if(!acc.find(o => o.id === order.id)){
+                            acc.push(order);
+                        }
+                        return acc;
+                    }, []);
+                    
+                    state.orderHistoryArchive = uniqueArchive;
+                    storage.set(`forti-order-history-archive-${category}`, uniqueArchive);
+                    
+                    if(firebaseInitialized){
+                        syncToFirebase('orderArchive', uniqueArchive);
+                    }
+                }
+                
+                // 清除當前訂單統計
+                state.orderHistory = [];
+                state.orderUpdateDate = null;
+                storage.set(`forti-order-history-${category}`, []);
+                storage.set(`forti-order-update-${category}`, null);
+                
+                if(firebaseInitialized){
+                    const basePath = CATEGORIES[category].firebasePath;
+                    database.ref(`${basePath}/orderHistory`).remove();
+                }
+                
+                alert('✅ 已清除所有已下單數量\n✅ 料件和廠商庫存已保留\n✅ 歷史記錄已保留（共 ' + state.orderHistoryArchive.length + ' 筆）');
+                render();
+            }
+        }
+        
+        function deleteSingleItem(itemCode){
+            const item = state.productCatalog.find(i => i.itemCode === itemCode);
+            if(!item){
+                alert('找不到此料號');
+                return;
+            }
+            
+            if(confirm(`確定要刪除料號 ${itemCode} 嗎？\n\n品名：${item.productName}\n型號：${item.model || '未知'}\n\n此操作無法復原！`)){
+                // 刪除料件
+                state.productCatalog = state.productCatalog.filter(i => i.itemCode !== itemCode);
+                storage.set('forti-product-catalog', state.productCatalog);
+                
+                // 刪除該料號的訂單記錄
+                state.orderHistory = state.orderHistory.filter(o => o.itemCode !== itemCode);
+                storage.set('forti-order-history', state.orderHistory);
+                
+                if(firebaseInitialized){
+                    syncToFirebase('catalog', state.productCatalog);
+                    syncToFirebase('orders', state.orderHistory);
+                }
+                
+                alert(`✅ 已刪除料號：${itemCode}`);
+                render();
+            }
+        }
+        
+        function renderOrderManager(){
+            const filteredOrders = state.orderHistory.filter(order => {
+                const search = state.orderSearchTerm.toLowerCase();
+                return order.itemCode.toLowerCase().includes(search) ||
+                       order.productName.toLowerCase().includes(search) ||
+                       (order.poNumber && order.poNumber.toLowerCase().includes(search)) ||
+                       (order.orderNumber && order.orderNumber.toLowerCase().includes(search)) ||
+                       (order.model && order.model.toLowerCase().includes(search));
+            });
+            
+            // 按時間倒序排列
+            const sortedOrders = [...filteredOrders].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+            
+            // 統計資料
+            const stats = {
+                totalOrders: state.orderHistory.length,
+                totalQuantity: state.orderHistory.reduce((sum, o) => sum + o.quantity, 0),
+                uniqueItems: new Set(state.orderHistory.map(o => o.itemCode)).size,
+                uniquePO: new Set(state.orderHistory.map(o => o.poNumber).filter(p => p)).size
+            };
+            
+            return `<div class="bg-white rounded-lg shadow-lg p-6 mb-6">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-2xl font-bold text-slate-800">📋 訂單管理</h2>
+                    <button onclick="toggleOrderManager()" class="px-4 py-2 bg-slate-600 text-white rounded-lg hover:bg-slate-700">返回庫存表</button>
+                </div>
+                
+                <div class="grid grid-cols-4 gap-4 mb-6">
+                    <div class="bg-gradient-to-br from-blue-50 to-blue-100 rounded-lg p-4">
+                        <div class="text-blue-600 text-sm font-semibold">訂單總數</div>
+                        <div class="text-2xl font-bold text-blue-800">${stats.totalOrders} 筆</div>
+                    </div>
+                    <div class="bg-gradient-to-br from-green-50 to-green-100 rounded-lg p-4">
+                        <div class="text-green-600 text-sm font-semibold">總下單量</div>
+                        <div class="text-2xl font-bold text-green-800">${stats.totalQuantity} 件</div>
+                    </div>
+                    <div class="bg-gradient-to-br from-purple-50 to-purple-100 rounded-lg p-4">
+                        <div class="text-purple-600 text-sm font-semibold">不同料號</div>
+                        <div class="text-2xl font-bold text-purple-800">${stats.uniqueItems} 項</div>
+                    </div>
+                    <div class="bg-gradient-to-br from-orange-50 to-orange-100 rounded-lg p-4">
+                        <div class="text-orange-600 text-sm font-semibold">採購單數</div>
+                        <div class="text-2xl font-bold text-orange-800">${stats.uniquePO} 張</div>
+                    </div>
+                </div>
+                
+                <div class="flex gap-4 mb-4 flex-wrap">
+                    <input type="text" placeholder="搜尋料號、品名、型號、PO單號、訂單單號..." value="${state.orderSearchTerm}" 
+                        oninput="state.orderSearchTerm=this.value;render();" 
+                        class="flex-1 min-w-[300px] px-4 py-2 border rounded-lg">
+                    <button onclick="exportOrdersCSV()" class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 whitespace-nowrap">
+                        📤 匯出訂單CSV
+                    </button>
+                    <button onclick="clearAllOrders()" class="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 whitespace-nowrap">
+                        🗑️ 清除所有訂單
+                    </button>
+                </div>
+            </div>
+            
+            <div class="bg-white rounded-lg shadow-lg overflow-hidden">
+                <div class="overflow-x-auto">
+                    <table class="w-full">
+                        <thead class="bg-gradient-to-r from-blue-700 to-blue-600 text-white">
+                            <tr>
+                                <th class="px-4 py-3 text-left text-xs font-semibold">料號</th>
+                                <th class="px-4 py-3 text-left text-xs font-semibold">品名</th>
+                                <th class="px-4 py-3 text-center text-xs font-semibold">型號</th>
+                                <th class="px-4 py-3 text-center text-xs font-semibold">數量</th>
+                                <th class="px-4 py-3 text-left text-xs font-semibold">採購單號</th>
+                                <th class="px-4 py-3 text-left text-xs font-semibold">訂單單號</th>
+                                <th class="px-4 py-3 text-left text-xs font-semibold">下單日期</th>
+                                <th class="px-4 py-3 text-left text-xs font-semibold">匯入時間</th>
+                            </tr>
+                        </thead>
+                        <tbody class="divide-y divide-slate-200">
+                            ${sortedOrders.length ? sortedOrders.map((order, index) => {
+                                const orderDate = order.notes.replace('批次匯入-', '') || '未知';
+                                const rowBg = index % 2 === 0 ? 'bg-white' : 'bg-slate-50';
+                                return `<tr class="${rowBg} hover:bg-blue-50 transition-colors">
+                                    <td class="px-4 py-3">
+                                        <span class="font-mono text-xs font-semibold text-slate-800">${order.itemCode}</span>
+                                    </td>
+                                    <td class="px-4 py-3">
+                                        <div class="text-xs text-slate-700 max-w-xs truncate" title="${order.productName}">${order.productName}</div>
+                                    </td>
+                                    <td class="px-4 py-3 text-center">
+                                        <span class="inline-block px-2 py-1 bg-blue-100 text-blue-800 rounded text-xs font-semibold">${order.model || '-'}</span>
+                                    </td>
+                                    <td class="px-4 py-3 text-center">
+                                        <span class="inline-block px-2 py-1 bg-green-100 text-green-800 rounded text-xs font-bold">${order.quantity}</span>
+                                    </td>
+                                    <td class="px-4 py-3">
+                                        <span class="text-xs text-slate-700 font-mono">${order.poNumber || '-'}</span>
+                                    </td>
+                                    <td class="px-4 py-3">
+                                        <span class="text-xs text-slate-700 font-mono">${order.orderNumber || '-'}</span>
+                                    </td>
+                                    <td class="px-4 py-3">
+                                        <span class="text-xs text-slate-700">${orderDate}</span>
+                                    </td>
+                                    <td class="px-4 py-3">
+                                        <span class="text-xs text-slate-500">${new Date(order.timestamp).toLocaleString('zh-TW')}</span>
+                                    </td>
+                                </tr>`;
+                            }).join('') : `
+                                <tr>
+                                    <td colspan="8" class="px-6 py-16 text-center">
+                                        <div class="text-slate-400">
+                                            <p class="text-lg font-medium">沒有訂單記錄</p>
+                                            <p class="text-sm mt-2">請先上傳採購訂單Excel</p>
+                                        </div>
+                                    </td>
+                                </tr>
+                            `}
+                        </tbody>
+                    </table>
+                </div>
+            </div>`;
+        }
+        
+        function renderInventoryTable(){
+            const merged=getMergedInventory();
+            const filtered=merged.filter(item=>{
+                const search=state.searchTerm.toLowerCase();
+                const match=item.itemCode.toLowerCase().includes(search)||item.productName.toLowerCase().includes(search)||(item.model||'').toLowerCase().includes(search);
+                const stock=!state.filterZeroStock||item.stockQty===null||item.stockQty>0;
+                return match&&stock;
+            });
+            
+            const category = state.currentCategory;
+            const isNetwork = category === 'network';
+            const hasModel = isNetwork;  // 只有網通產品顯示型號
+            const stockEditable = !isNetwork;  // Server/Client 可編輯庫存
+            
+            return `<div class="bg-white rounded-lg shadow-lg p-6 mb-6">
+                <div class="flex gap-4 mb-4 flex-wrap">
+                    <input type="text" placeholder="搜尋料號、品名${hasModel?'或型號':''}..." value="${state.searchTerm}" 
+                        oninput="state.searchTerm=this.value;render();" 
+                        class="flex-1 min-w-[200px] px-4 py-2 border rounded-lg">
+                    <label class="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 whitespace-nowrap cursor-pointer">
+                        📥 匯入料件Excel
+                        <input type="file" accept=".xlsx,.xls" onchange="handleCatalogExcelUpload(event)" class="hidden">
+                    </label>
+                    ${isNetwork ? `
+                    <button onclick="handleStockSync()" class="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 whitespace-nowrap flex items-center gap-2">
+                        ${state.autoLoading?'<span class="animate-spin">⟳</span>':''} 重新載入庫存
+                    </button>
+                    ` : ''}
+                    <label class="px-4 py-2 bg-orange-600 text-white rounded-lg hover:bg-orange-700 whitespace-nowrap cursor-pointer">
+                        📥 上傳採購訂單
+                        <input type="file" accept=".xlsx,.xls" onchange="handleExcelUpload(event)" class="hidden">
+                    </label>
+                    <div class="relative inline-block">
+                        <button onclick="toggleClearMenu(event)" class="px-3 py-2 bg-red-500 text-white text-xs rounded hover:bg-red-600 whitespace-nowrap flex items-center gap-1">
+                            🗑️ 清除選項 ▾
+                        </button>
+                        <div id="clearMenu" class="hidden absolute right-0 mt-1 w-52 bg-white rounded-lg shadow-xl border border-slate-200 z-50">
+                            <button onclick="clearAllCatalog();toggleClearMenu();" class="w-full text-left px-4 py-2 text-sm text-slate-700 hover:bg-red-50 rounded-t-lg border-b border-slate-100">
+                                🗑️ 清除所有料件
+                            </button>
+                            <button onclick="clearUploadedOrders();toggleClearMenu();" class="w-full text-left px-4 py-2 text-sm text-slate-700 hover:bg-orange-50 border-b border-slate-100">
+                                📋 清除已下單數量
+                            </button>
+                            <button onclick="clearAllOrders();toggleClearMenu();" class="w-full text-left px-4 py-2 text-sm text-slate-700 hover:bg-red-50 rounded-b-lg">
+                                🗑️ 清除所有訂單記錄
+                            </button>
+                        </div>
+                    </div>
+                </div>
+                <div class="flex gap-6 text-sm flex-wrap">
+                    <div class="flex items-center gap-2">
+                        <span>低庫存門檻：</span>
+                        <input type="number" value="${state.lowStockThreshold}" 
+                            onchange="state.lowStockThreshold=parseInt(this.value)||0;render();" 
+                            class="w-20 px-2 py-1 border rounded">
+                        <span>件</span>
+                    </div>
+                    <label class="flex items-center gap-2">
+                        <input type="checkbox" ${state.filterZeroStock?'checked':''} 
+                            onchange="state.filterZeroStock=this.checked;render();"> 
+                        隱藏無庫存
+                    </label>
+                </div>
+            </div>
+            
+            <div class="bg-white rounded-lg shadow-lg overflow-hidden">
+                <div class="overflow-x-auto">
+                    <table class="w-full table-fixed">
+                        <thead class="bg-gradient-to-r from-slate-700 to-slate-600 text-white">
+                            <tr>
+                                <th class="px-4 py-3 text-left text-xs font-semibold" style="width: 140px">料號</th>
+                                <th class="px-4 py-3 text-left text-xs font-semibold" style="width: ${hasModel ? '280px' : '360px'}">品名</th>
+                                ${hasModel ? '<th class="px-4 py-3 text-center text-xs font-semibold" style="width: 90px">型號</th>' : ''}
+                                <th class="px-4 py-3 text-center text-xs font-semibold" style="width: 70px">庫存</th>
+                                <th class="px-4 py-3 text-center text-xs font-semibold" style="width: 80px">此料號<br>已下單</th>
+                                ${hasModel ? '<th class="px-4 py-3 text-center text-xs font-semibold" style="width: 80px">型號<br>總下單</th>' : ''}
+                                <th class="px-4 py-3 text-center text-xs font-semibold" style="width: 70px">剩餘</th>
+                                <th class="px-4 py-3 text-left text-xs font-semibold">備註</th>
+                                <th class="px-4 py-3 text-center text-xs font-semibold" style="width: 60px">操作</th>
+                            </tr>
+                        </thead>
+                        <tbody class="divide-y divide-slate-200">
+                            ${filtered.length ? filtered.map(i => {
+                                const stockColor=i.stockQty===null?'':i.stockQty===0?'bg-red-100 text-red-700':i.stockQty<=state.lowStockThreshold?'bg-orange-100 text-orange-700':i.stockQty<=state.lowStockThreshold*2?'bg-yellow-100 text-yellow-700':'bg-green-100 text-green-700';
+                                const remainingColor=i.remainingQty===null?'':i.remainingQty<=0?'bg-red-100 text-red-700':i.remainingQty<=state.lowStockThreshold?'bg-orange-100 text-orange-700':i.remainingQty<=state.lowStockThreshold*2?'bg-yellow-100 text-yellow-700':'bg-green-100 text-green-700';
+                                return `<tr class="hover:bg-blue-50 transition-colors">
+                                    <td class="px-4 py-3">
+                                        <span class="font-mono text-xs font-semibold ${i.itemCode.startsWith('未申請')?'text-red-600':'text-slate-800'}">
+                                            ${i.itemCode.startsWith('未申請')?'未申請':i.itemCode}
+                                        </span>
+                                    </td>
+                                    <td class="px-4 py-3">
+                                        <div class="text-xs text-slate-700 leading-tight" title="${i.productName}">${i.productName}</div>
+                                    </td>
+                                    ${hasModel ? `
+                                    <td class="px-4 py-3 text-center">
+                                        <span class="inline-block px-2 py-1 bg-blue-100 text-blue-800 rounded text-xs font-bold">${i.model}</span>
+                                    </td>
+                                    ` : ''}
+                                    <td class="px-4 py-3 text-center">
+                                        ${stockEditable ? 
+                                            `<div class="flex flex-col items-center gap-1">
+                                                <input type="number" 
+                                                    value="${i.stockQty===null?'':i.stockQty}" 
+                                                    onchange="updateStock('${i.itemCode}', this.value)"
+                                                    placeholder="數量"
+                                                    title="${i.stockUpdateTime?'最後更新: '+new Date(i.stockUpdateTime).toLocaleString('zh-TW'):'尚未設定庫存'}"
+                                                    class="w-16 px-2 py-1 text-xs text-center border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500 ${stockColor}">
+                                                ${i.stockUpdateTime?`<span class="text-[10px] text-slate-400 whitespace-nowrap" title="最後更新時間">${formatTime(i.stockUpdateTime)}</span>`:''}
+                                            </div>` 
+                                            : 
+                                            (i.stockQty===null?'<span class="text-slate-400 text-xs">-</span>':`<span class="inline-block px-2 py-1 rounded text-xs font-bold ${stockColor}">${i.stockQty}</span>`)
+                                        }
+                                    </td>
+                                    <td class="px-4 py-3 text-center">
+                                        ${i.orderedQty>0?`<span onclick="viewOrderDetails('${i.itemCode}')" class="inline-block px-2 py-1 bg-slate-100 text-slate-700 rounded text-xs font-semibold cursor-pointer hover:bg-slate-200 transition" title="點擊查看訂單明細">${i.orderedQty}</span>`:`<span class="inline-block px-2 py-1 bg-slate-100 text-slate-400 rounded text-xs">0</span>`}
+                                    </td>
+                                    ${hasModel ? `
+                                    <td class="px-4 py-3 text-center">
+                                        <span class="inline-block px-2 py-1 bg-purple-100 text-purple-700 rounded text-xs font-bold">${i.modelTotalOrdered||0}</span>
+                                    </td>
+                                    ` : ''}
+                                    <td class="px-4 py-3 text-center">
+                                        ${i.remainingQty===null?'<span class="text-slate-400 text-xs">-</span>':`<span class="inline-block px-2 py-1 rounded text-xs font-bold ${remainingColor}">${i.remainingQty}</span>`}
+                                    </td>
+                                    <td class="px-4 py-3">
+                                        <input type="text" value="${i.notes||''}" 
+                                            onchange="updateNotes('${i.itemCode}',this.value);render();" 
+                                            placeholder="輸入備註..." 
+                                            class="w-full px-2 py-1 text-xs border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500">
+                                    </td>
+                                    <td class="px-4 py-3 text-center">
+                                        <button onclick="deleteSingleItem('${i.itemCode}')" 
+                                            class="px-2 py-1 bg-red-100 text-red-600 text-xs rounded hover:bg-red-200 transition"
+                                            title="刪除此料號">
+                                            🗑️
+                                        </button>
+                                    </td>
+                                </tr>`;
+                            }).join('') : `
+                                <tr>
+                                    <td colspan="${hasModel ? '9' : '7'}" class="px-6 py-16 text-center">
+                                        <div class="text-slate-400">
+                                            <p class="text-lg font-medium">${state.productCatalog.length?'沒有符合條件的資料':'請先匯入料件清單'}</p>
+                                        </div>
+                                    </td>
+                                </tr>
+                            `}
+                        </tbody>
+                    </table>
+                </div>
+            </div>`;
+        }
+        
+        function render(){
+            const merged=getMergedInventory();
+            const filtered=merged.filter(item=>{
+                const search=state.searchTerm.toLowerCase();
+                const match=item.itemCode.toLowerCase().includes(search)||item.productName.toLowerCase().includes(search)||item.model.toLowerCase().includes(search);
+                const stock=!state.filterZeroStock||item.stockQty===null||item.stockQty>0;
+                return match&&stock;
+            });
+            const zeroStock=merged.filter(i=>i.stockQty===0).length;
+            const lowStock=merged.filter(i=>i.stockQty>0&&i.stockQty<=state.lowStockThreshold).length;
+            
+            const connectionStatus = state.firebaseConnected ? 
+                '<span class="text-green-600 font-bold">🟢 即時連線</span>' : 
+                '<span class="text-orange-600 font-bold">🟠 離線模式</span>';
+            
+            // 生成類別切換按鈕
+            const categoryButtons = Object.values(CATEGORIES).map(cat => {
+                const isActive = state.currentCategory === cat.id;
+                const activeClass = isActive ? 'bg-blue-600 text-white shadow-lg scale-105' : 'bg-white text-slate-700 hover:bg-blue-50';
+                return `
+                    <button 
+                        onclick="switchCategory('${cat.id}')" 
+                        class="flex-1 py-4 px-6 rounded-lg shadow transition-all duration-200 ${activeClass} flex flex-col items-center gap-2"
+                    >
+                        <span class="text-3xl">${cat.icon}</span>
+                        <span class="font-bold text-lg">${cat.name}</span>
+                        <span class="text-sm opacity-75">${isActive ? state.productCatalog.length + ' 項料件' : ''}</span>
+                    </button>
+                `;
+            }).join('');
+            
+            // 根據類別決定顯示的日期資訊
+            const category = state.currentCategory;
+            const isNetwork = category === 'network';
+            
+            const dateInfoHtml = isNetwork ? 
+                // 網通產品：顯示廠商更新、庫存同步、訂單更新
+                `<div class="grid grid-cols-4 gap-4 text-sm">
+                    <div><span class="text-slate-500">廠商更新：</span><strong>${state.supplierUpdateDate||'未知'}</strong></div>
+                    <div><span class="text-slate-500">庫存同步：</span><strong>${state.lastSyncDate?new Date(state.lastSyncDate).toLocaleString('zh-TW'):'未同步'}</strong></div>
+                    <div><span class="text-slate-500">訂單更新：</span><strong>${state.orderUpdateDate?new Date(state.orderUpdateDate).toLocaleString('zh-TW'):'未匯入'}</strong></div>
+                    <div>${!state.lastSyncDate||(new Date()-new Date(state.lastSyncDate))>604800000?'<span class="text-orange-600 font-bold">需要更新</span>':''}</div>
+                </div>` :
+                // Server/Client：只顯示訂單更新
+                `<div class="grid grid-cols-3 gap-4 text-sm">
+                    <div><span class="text-slate-500">料件總數：</span><strong>${state.productCatalog.length} 項</strong></div>
+                    <div><span class="text-slate-500">訂單更新：</span><strong>${state.orderUpdateDate?new Date(state.orderUpdateDate).toLocaleString('zh-TW'):'未匯入'}</strong></div>
+                    <div><span class="text-slate-500 text-xs">💡 提示：庫存欄位可直接輸入數字</span></div>
+                </div>`;
+            
+            document.getElementById('app').innerHTML=`<div class="max-w-[1600px] mx-auto"><div class="bg-white rounded-lg shadow-lg p-6 mb-6"><div class="flex justify-between items-start mb-2"><h1 class="text-3xl font-bold text-slate-800">Infra 庫存監控系統 <span class="text-sm font-normal text-blue-600">⚡ Firebase即時版</span></h1><div class="text-right"><div class="text-xs text-slate-400">版本 ${APP_VERSION}</div><button onclick="forceCheckUpdate()" class="text-xs text-blue-600 hover:text-blue-800 underline mt-1">檢查更新</button></div></div><p class="text-slate-600 mb-4">多類別庫存管理 | 即時對應與追蹤 | ${connectionStatus}</p>${dateInfoHtml}${!firebaseInitialized?'<div class="bg-yellow-50 border-l-4 border-yellow-400 p-4 text-sm mt-4"><p class="font-bold text-yellow-800 mb-2">⚠️ Firebase 未設定</p><p class="text-yellow-700">請在程式碼中填入 Firebase 設定，即可啟用即時同步功能。目前使用本地模式，資料不會同步給其他人。</p></div>':''}</div>
+            
+            <!-- 類別切換按鈕 -->
+            <div class="flex gap-4 mb-6">
+                ${categoryButtons}
+            </div>
+            
+            <!-- 當前類別統計卡片 -->
+            <div class="grid grid-cols-4 gap-4 mb-6">
+                <div class="bg-white rounded-lg shadow p-6">
+                    <div class="text-slate-600 text-sm">料件總數</div>
+                    <div class="text-3xl font-bold text-slate-800">${state.productCatalog.length}</div>
+                </div>
+                <div class="bg-white rounded-lg shadow p-6">
+                    <div class="text-slate-600 text-sm">無庫存</div>
+                    <div class="text-3xl font-bold text-red-600">${zeroStock}</div>
+                </div>
+                <div class="bg-white rounded-lg shadow p-6">
+                    <div class="text-slate-600 text-sm">低庫存</div>
+                    <div class="text-3xl font-bold text-orange-600">${lowStock}</div>
+                </div>
+                <div class="bg-white rounded-lg shadow p-6 cursor-pointer hover:shadow-lg transition" onclick="toggleOrderManager()">
+                    <div class="text-slate-600 text-sm">訂單數 ${state.showOrderManager?'(點擊關閉)':'(點擊查看)'}</div>
+                    <div class="text-3xl font-bold text-green-600">${state.orderHistory.length}</div>
+                </div>
+            </div>
+            
+            ${state.showOrderManager?renderOrderManager():renderInventoryTable()}</div>`;
+        }
+        
+        loadData();
+        render();
+    </script>
+</body>
+</html>
